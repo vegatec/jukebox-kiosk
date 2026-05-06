@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv*/
+venv*/
+env*/
+ENV/
+
+# Distribution / packaging
+*.whl
+*.tar.gz
+MANIFEST
+
+# Unit test / coverage
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.hypothesis/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# mypy / pyright / ruff
+.mypy_cache/
+.ruff_cache/
+pyrightconfig.json
+
+# IDE
+.vscode/settings.json
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
