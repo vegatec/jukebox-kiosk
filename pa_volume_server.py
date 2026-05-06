@@ -6,6 +6,9 @@ import os
 import time
 import threading
 
+# Strip Snap's LD_LIBRARY_PATH so GTK subprocesses don't hit libc conflicts
+_clean_env = {k: v for k, v in os.environ.items() if k != "LD_LIBRARY_PATH"}
+
 # --- Configuration ---
 PORT = 8000
 VOLUME_COMMAND = "pactl"
@@ -54,24 +57,49 @@ def execute_volume_change(direction):
     """Executes the pactl command to change the volume and updates global state."""
     sign = '+' if direction == 'raise' else '-'
     volume_change = f"{sign}{VOLUME_STEP}%"
-    
+
     try:
         pactl_args = [
-            VOLUME_COMMAND, 
-            "set-sink-volume", 
+            VOLUME_COMMAND,
+            "set-sink-volume",
             SINK_IDENTIFIER,
             volume_change
         ]
-        
+
         subprocess.run(pactl_args, check=True, capture_output=True, text=True)
-        
+
         # After changing, immediately fetch the new accurate volume level and update state
-        new_level = get_current_volume() 
+        new_level = get_current_volume()
 
 	# Call the external script and pass the volume as an argument
-        subprocess.Popen(["python3", "volume-indicator.py", str(new_level)])
-        
+        subprocess.Popen(["python3", "volume-indicator.py", str(new_level)], env=_clean_env)
+
         return True, f"Volume adjusted to {new_level}%."
+
+    except FileNotFoundError:
+        return False, f"Error: '{VOLUME_COMMAND}' not found."
+    except subprocess.CalledProcessError as e:
+        return False, f"Error executing pactl: {e.stderr.strip()}"
+    except Exception as e:
+        return False, f"An unexpected error occurred: {e}"
+
+
+def execute_volume_set(percentage):
+    """Sets the volume to an exact percentage (1-100) and updates global state."""
+    if not isinstance(percentage, (int, float)) or not (0 <= percentage <= 100):
+        return False, "Invalid level. Must be a number between 0 and 100."
+
+    level = int(percentage)
+    try:
+        subprocess.run(
+            [VOLUME_COMMAND, "set-sink-volume", SINK_IDENTIFIER, f"{level}%"],
+            check=True, capture_output=True, text=True
+        )
+
+        new_level = get_current_volume()
+        subprocess.Popen(["python3", "volume-indicator.py", str(new_level)], env=_clean_env)
+
+        return True, f"Volume set to {new_level}%."
 
     except FileNotFoundError:
         return False, f"Error: '{VOLUME_COMMAND}' not found."
@@ -168,18 +196,29 @@ class SSEVolumeHandler(http.server.SimpleHTTPRequestHandler):
             if action in ['raise', 'lower']:
                 # The execution updates the global state
                 success, message = execute_volume_change(action)
-                
-                # Retrieve the newly updated level for the response
+
                 current_level = global_volume_state['level']
-                
+
                 if success:
                     response = {"status": "success", "message": message, "volume": current_level}
                     self._set_headers(200)
                 else:
                     response = {"status": "error", "message": message, "action": action}
                     self._set_headers(500)
+            elif action == 'set':
+                level = data.get('level')
+                success, message = execute_volume_set(level)
+
+                current_level = global_volume_state['level']
+
+                if success:
+                    response = {"status": "success", "message": message, "volume": current_level}
+                    self._set_headers(200)
+                else:
+                    response = {"status": "error", "message": message, "action": action}
+                    self._set_headers(400)
             else:
-                response = {"status": "error", "message": "Invalid action. Must be 'raise' or 'lower'.", "action": action}
+                response = {"status": "error", "message": "Invalid action. Must be 'raise', 'lower', or 'set'.", "action": action}
                 self._set_headers(400)
 
         except json.JSONDecodeError:
