@@ -55,8 +55,14 @@ def get_current_volume():
 
 def execute_volume_change(direction):
     """Executes the pactl command to change the volume and updates global state."""
-    sign = '+' if direction == 'raise' else '-'
-    volume_change = f"{sign}{VOLUME_STEP}%"
+    if direction == 'raise':
+        current = get_current_volume()
+        if current >= 100:
+            return True, "Volume is already at 100%."
+        target = min(current + VOLUME_STEP, 100)
+        volume_change = f"{target}%"
+    else:
+        volume_change = f"-{VOLUME_STEP}%"
 
     try:
         pactl_args = [
