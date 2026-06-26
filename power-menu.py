@@ -1,15 +1,16 @@
 import gi
 import subprocess
 import os
-import sys
+import json
 import math
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, Gdk, GLib
 import cairo
 
-CORRECT_PIN = sys.argv[1] if len(sys.argv) > 1 else "1234"
 SINK_IDENTIFIER = "0"
 _clean_env = {k: v for k, v in os.environ.items() if k != "LD_LIBRARY_PATH"}
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+PIN_LENGTH = 4
 
 # Geometry
 MENU_W, MENU_H = 360, 280
@@ -19,9 +20,10 @@ CORNER         = 28
 BTN_R          = 14
 
 # Phases
-PHASE_MENU   = 'menu'
-PHASE_PIN    = 'pin'
-PHASE_SLIDER = 'slider'
+PHASE_MENU       = 'menu'
+PHASE_PIN        = 'pin'
+PHASE_SLIDER     = 'slider'
+PHASE_CHANGE_PIN = 'change_pin'
 
 # Timeouts (ms)
 MENU_DISMISS_MS    = 8_000
@@ -38,6 +40,36 @@ GRAY_MID   = (0.55, 0.55, 0.55, 0.80)
 WHITE      = (1.00, 1.00, 1.00, 0.90)
 
 
+# --- Config persistence ---
+
+def load_pin():
+    try:
+        with open(CONFIG_FILE) as f:
+            data = json.load(f)
+        pin = str(data.get("power_menu_pin", "1234"))
+        if pin.isdigit() and len(pin) == PIN_LENGTH:
+            return pin
+    except Exception:
+        pass
+    return "1234"
+
+
+def save_pin(pin):
+    try:
+        try:
+            with open(CONFIG_FILE) as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+        data["power_menu_pin"] = pin
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"Failed to save config: {e}")
+
+
+# --- Drawing helpers ---
+
 def _set_color(cr, rgba):
     cr.set_source_rgba(*rgba)
 
@@ -52,12 +84,11 @@ def rounded_rect(cr, x, y, w, h, r):
 
 
 def top_rounded_rect(cr, x, y, w, h, r):
-    """Rounded on top corners only."""
     cr.new_sub_path()
-    cr.arc(x + w - r, y + r,     r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
     cr.line_to(x + w, y + h)
     cr.line_to(x,     y + h)
-    cr.arc(x + r,     y + r,     r,  math.pi,      -math.pi / 2)
+    cr.arc(x + r,     y + r, r,  math.pi,      -math.pi / 2)
     cr.close_path()
 
 
@@ -95,6 +126,9 @@ class PowerMenuWindow(Gtk.Window):
         self.set_position(Gtk.WindowPosition.CENTER)
         self.set_default_size(MENU_W, MENU_H)
 
+        self._correct_pin  = load_pin()
+
+        # Volume slider state
         self._phase        = PHASE_MENU
         self._pin_entered  = ''
         self._pin_error    = False
@@ -103,9 +137,19 @@ class PowerMenuWindow(Gtk.Window):
         self._track_x      = 0
         self._track_w      = 1
         self._btn_rects    = {}
-        self._menu_timer   = None
-        self._pin_timer    = None
-        self._slider_timer = None
+
+        # Change-PIN state
+        self._change_step    = 'new'   # 'new' | 'confirm'
+        self._change_buf     = ''
+        self._new_pin_first  = ''
+        self._change_error   = None
+        self._change_success = False
+
+        # Timers
+        self._menu_timer       = None
+        self._pin_timer        = None
+        self._slider_timer     = None
+        self._change_pin_timer = None
 
         self.add_events(
             Gdk.EventMask.BUTTON_PRESS_MASK |
@@ -119,12 +163,18 @@ class PowerMenuWindow(Gtk.Window):
 
         self._menu_timer = GLib.timeout_add(MENU_DISMISS_MS, Gtk.main_quit)
 
+    # --- Timer helpers ---
+
+    def _cancel_timer(self, attr):
+        t = getattr(self, attr)
+        if t:
+            GLib.source_remove(t)
+            setattr(self, attr, None)
+
     # --- Phase transitions ---
 
     def _goto_pin(self):
-        if self._menu_timer:
-            GLib.source_remove(self._menu_timer)
-            self._menu_timer = None
+        self._cancel_timer('_menu_timer')
         self._phase = PHASE_PIN
         self._pin_entered = ''
         self._pin_error = False
@@ -134,9 +184,8 @@ class PowerMenuWindow(Gtk.Window):
         self._pin_timer = GLib.timeout_add(PIN_DISMISS_MS, Gtk.main_quit)
 
     def _goto_slider(self):
-        if self._pin_timer:
-            GLib.source_remove(self._pin_timer)
-            self._pin_timer = None
+        self._cancel_timer('_pin_timer')
+        self._cancel_timer('_change_pin_timer')
         self._phase = PHASE_SLIDER
         self._btn_rects = {}
         self._volume = get_current_volume()
@@ -148,9 +197,27 @@ class PowerMenuWindow(Gtk.Window):
         self.queue_draw()
         self._reset_slider_timer()
 
+    def _goto_change_pin(self):
+        self._cancel_timer('_slider_timer')
+        self._phase = PHASE_CHANGE_PIN
+        self._change_step = 'new'
+        self._change_buf = ''
+        self._new_pin_first = ''
+        self._change_error = None
+        self._change_success = False
+        self._btn_rects = {}
+
+        monitor = Gdk.Display.get_default().get_primary_monitor()
+        geo = monitor.get_geometry()
+        cx = geo.x + (geo.width - PIN_W) // 2
+        cy = geo.y + (geo.height - PIN_H) // 2
+        self.resize(PIN_W, PIN_H)
+        self.move(cx, cy)
+        self.queue_draw()
+        self._change_pin_timer = GLib.timeout_add(PIN_DISMISS_MS, Gtk.main_quit)
+
     def _reset_slider_timer(self):
-        if self._slider_timer:
-            GLib.source_remove(self._slider_timer)
+        self._cancel_timer('_slider_timer')
         self._slider_timer = GLib.timeout_add(SLIDER_DISMISS_MS, Gtk.main_quit)
 
     # --- Drawing ---
@@ -164,13 +231,15 @@ class PowerMenuWindow(Gtk.Window):
         if self._phase == PHASE_MENU:
             self._draw_menu(cr)
         elif self._phase == PHASE_PIN:
-            self._draw_pin(cr)
+            self._draw_pin_panel(cr, "ENTER PIN", self._pin_entered,
+                                 len(self._correct_pin),
+                                 "Incorrect PIN" if self._pin_error else None)
         elif self._phase == PHASE_SLIDER:
-            win_w = self.get_allocated_width()
-            self._draw_slider(cr, win_w)
+            self._draw_slider(cr, self.get_allocated_width())
+        elif self._phase == PHASE_CHANGE_PIN:
+            self._draw_change_pin(cr)
 
     def _draw_menu(self, cr):
-        # Background card
         rounded_rect(cr, 0, 0, MENU_W, MENU_H, CORNER)
         _set_color(cr, DARK_CARD)
         cr.fill()
@@ -194,24 +263,23 @@ class PowerMenuWindow(Gtk.Window):
                                font="Sans", size=14, bold=True, rgba=color)
             self._btn_rects[key] = (bx, y, bw, bh)
 
-    def _draw_pin(self, cr):
+    def _draw_pin_panel(self, cr, header, buf, n_dots, error_msg):
+        """Shared renderer for both ENTER PIN and CHANGE PIN phases."""
         rounded_rect(cr, 0, 0, PIN_W, PIN_H, CORNER)
         _set_color(cr, DARK_CARD)
         cr.fill()
 
-        draw_text_centered(cr, "ENTER PIN", PIN_W / 2, 36,
+        draw_text_centered(cr, header, PIN_W / 2, 36,
                            font="Sans", size=15, bold=True, rgba=WHITE)
 
-        # PIN dots
         dot_r = 10
-        n_dots = len(CORRECT_PIN)
         spacing = 28
         total_w = (n_dots - 1) * spacing
         dot_cx0 = PIN_W / 2 - total_w / 2
         dot_cy = 86
         for i in range(n_dots):
             cx = dot_cx0 + i * spacing
-            if i < len(self._pin_entered):
+            if i < len(buf):
                 _set_color(cr, CYAN)
                 cr.arc(cx, dot_cy, dot_r, 0, 2 * math.pi)
                 cr.fill()
@@ -221,12 +289,10 @@ class PowerMenuWindow(Gtk.Window):
                 cr.set_line_width(1.5)
                 cr.stroke()
 
-        # Error message
-        if self._pin_error:
-            draw_text_centered(cr, "Incorrect PIN", PIN_W / 2, 118,
+        if error_msg:
+            draw_text_centered(cr, error_msg, PIN_W / 2, 118,
                                font="Sans", size=13, rgba=DANGER_RED)
 
-        # Numpad: 3 cols × 4 rows
         pad_labels = [
             ['1', '2', '3'],
             ['4', '5', '6'],
@@ -255,13 +321,31 @@ class PowerMenuWindow(Gtk.Window):
                 key = 'backspace' if label == '⌫' else label
                 self._btn_rects[key] = (bx, by, cell_w, cell_h)
 
+    def _draw_change_pin(self, cr):
+        if self._change_success:
+            header = "PIN SAVED"
+            error_msg = None
+        elif self._change_step == 'new':
+            header = "NEW PIN"
+            error_msg = self._change_error
+        else:
+            header = "CONFIRM PIN"
+            error_msg = self._change_error
+
+        if self._change_success:
+            rounded_rect(cr, 0, 0, PIN_W, PIN_H, CORNER)
+            _set_color(cr, DARK_CARD)
+            cr.fill()
+            draw_text_centered(cr, "PIN SAVED", PIN_W / 2, PIN_H / 2,
+                               font="Sans", size=20, bold=True, rgba=CYAN)
+        else:
+            self._draw_pin_panel(cr, header, self._change_buf, PIN_LENGTH, error_msg)
+
     def _draw_slider(self, cr, win_w):
-        # Background strip, rounded on top corners only
         top_rounded_rect(cr, 0, 0, win_w, SLIDER_H, 16)
         _set_color(cr, DARK_CARD)
         cr.fill()
 
-        # Volume label
         label = f"VOL  {self._volume}%"
         _set_color(cr, CYAN)
         cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
@@ -270,15 +354,21 @@ class PowerMenuWindow(Gtk.Window):
         cr.move_to(20, SLIDER_H / 2 - ext.height / 2 - ext.y_bearing)
         cr.show_text(label)
 
-        # Track geometry
-        done_area = 120
+        # Two buttons on the right: CHANGE PIN + DONE
+        done_w, done_h, done_y = 90, 56, 22
+        chg_w = 110
+        btn_gap = 8
+        done_x = win_w - done_w - 16
+        chg_x  = done_x - btn_gap - chg_w
+
+        right_margin = win_w - chg_x + 8
         track_x = 160
-        track_w = win_w - track_x - done_area
+        track_w = win_w - track_x - right_margin
         track_cy = SLIDER_H // 2
         self._track_x = track_x
         self._track_w = track_w
 
-        # Background track
+        # Track background
         rounded_rect(cr, track_x, track_cy - 4, track_w, 8, 4)
         _set_color(cr, GRAY_MID)
         cr.fill()
@@ -300,11 +390,16 @@ class PowerMenuWindow(Gtk.Window):
         cr.set_line_width(1.5)
         cr.stroke()
 
-        # Done button
-        done_x = win_w - 110
-        done_y = 22
-        done_w = 90
-        done_h = 56
+        # CHANGE PIN button
+        rounded_rect(cr, chg_x, done_y, chg_w, done_h, BTN_R)
+        _set_color(cr, CYAN_DIM)
+        cr.set_line_width(1.5)
+        cr.stroke()
+        draw_text_centered(cr, "CHANGE PIN", chg_x + chg_w / 2, done_y + done_h / 2,
+                           font="Sans", size=12, bold=True, rgba=CYAN_DIM)
+        self._btn_rects['change_pin'] = (chg_x, done_y, chg_w, done_h)
+
+        # DONE button
         rounded_rect(cr, done_x, done_y, done_w, done_h, BTN_R)
         _set_color(cr, GRAY_MID)
         cr.set_line_width(1.5)
@@ -344,13 +439,24 @@ class PowerMenuWindow(Gtk.Window):
         elif self._phase == PHASE_SLIDER:
             if self._hit('done', ex, ey):
                 Gtk.main_quit()
+            elif self._hit('change_pin', ex, ey):
+                self._goto_change_pin()
             elif (self._track_x <= ex <= self._track_x + self._track_w and
                   0 <= ey <= SLIDER_H):
                 self._vol_dragging = True
                 self._update_vol_from_x(ex)
                 self._reset_slider_timer()
 
-    def _on_release(self, _widget, event):
+        elif self._phase == PHASE_CHANGE_PIN:
+            if not self._change_success:
+                for digit in '0123456789':
+                    if self._hit(digit, ex, ey):
+                        self._change_digit(digit)
+                        return
+                if self._hit('backspace', ex, ey):
+                    self._change_backspace()
+
+    def _on_release(self, _widget, _event):
         if self._phase == PHASE_SLIDER and self._vol_dragging:
             self._vol_dragging = False
             self._apply_volume()
@@ -374,13 +480,13 @@ class PowerMenuWindow(Gtk.Window):
         subprocess.Popen(["python3", "volume-indicator.py", str(self._volume)],
                          env=_clean_env)
 
-    # --- PIN helpers ---
+    # --- PIN entry helpers ---
 
     def _pin_digit(self, digit):
-        if len(self._pin_entered) < len(CORRECT_PIN):
+        if len(self._pin_entered) < len(self._correct_pin):
             self._pin_entered += digit
             self.queue_draw()
-            if len(self._pin_entered) == len(CORRECT_PIN):
+            if len(self._pin_entered) == len(self._correct_pin):
                 GLib.timeout_add(80, self._check_pin)
 
     def _pin_backspace(self):
@@ -388,21 +494,58 @@ class PowerMenuWindow(Gtk.Window):
         self.queue_draw()
 
     def _check_pin(self):
-        if self._pin_entered == CORRECT_PIN:
+        if self._pin_entered == self._correct_pin:
             self._goto_slider()
         else:
-            self._wrong_pin()
+            self._pin_error = True
+            self._pin_entered = ''
+            self.queue_draw()
+            GLib.timeout_add(PIN_ERROR_CLEAR_MS, self._clear_pin_error)
         return False
-
-    def _wrong_pin(self):
-        self._pin_error = True
-        self._pin_entered = ''
-        self.queue_draw()
-        GLib.timeout_add(PIN_ERROR_CLEAR_MS, self._clear_pin_error)
 
     def _clear_pin_error(self):
         self._pin_error = False
         self.queue_draw()
+        return False
+
+    # --- Change-PIN helpers ---
+
+    def _change_digit(self, digit):
+        if len(self._change_buf) < PIN_LENGTH:
+            self._change_buf += digit
+            self.queue_draw()
+            if len(self._change_buf) == PIN_LENGTH:
+                GLib.timeout_add(80, self._advance_change_pin)
+
+    def _change_backspace(self):
+        self._change_buf = self._change_buf[:-1]
+        self._change_error = None
+        self.queue_draw()
+
+    def _advance_change_pin(self):
+        if self._change_step == 'new':
+            self._new_pin_first = self._change_buf
+            self._change_buf = ''
+            self._change_step = 'confirm'
+            self._change_error = None
+            self.queue_draw()
+        else:
+            if self._change_buf == self._new_pin_first:
+                save_pin(self._new_pin_first)
+                self._correct_pin = self._new_pin_first
+                self._change_success = True
+                self.queue_draw()
+                GLib.timeout_add(1200, self._goto_slider_from_change)
+            else:
+                self._change_error = "PINs don't match — try again"
+                self._change_buf = ''
+                self._change_step = 'new'
+                self._new_pin_first = ''
+                self.queue_draw()
+        return False
+
+    def _goto_slider_from_change(self):
+        self._goto_slider()
         return False
 
     # --- System actions ---

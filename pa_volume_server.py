@@ -14,7 +14,6 @@ PORT = 8000
 VOLUME_COMMAND = "pactl"
 VOLUME_STEP = 5
 SINK_IDENTIFIER = "0"
-POWER_MENU_PIN = "1234"   # PIN required to access volume control from power menu
 
 # Global state to hold the latest known volume. This is accessed by all threads.
 # We use a Lock to ensure thread-safe updates.
@@ -189,7 +188,7 @@ class SSEVolumeHandler(http.server.SimpleHTTPRequestHandler):
             self._set_headers(200)
             self.wfile.write(json.dumps({"status": "success", "message": "QR code displayed"}).encode('utf-8'))
         elif self.path == '/power-menu':
-            subprocess.Popen(["python3", "power-menu.py", POWER_MENU_PIN], env=_clean_env)
+            subprocess.Popen(["python3", "power-menu.py"], env=_clean_env)
             self._set_headers(200)
             self.wfile.write(json.dumps({"status": "success", "message": "Power menu displayed"}).encode('utf-8'))
         else:
