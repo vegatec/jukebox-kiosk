@@ -183,6 +183,10 @@ class SSEVolumeHandler(http.server.SimpleHTTPRequestHandler):
                     # Connection closed by client or network error
                     print(f"SSE connection closed: {e}")
                     break
+        elif self.path == '/qr':
+            subprocess.Popen(["python3", "qr-indicator.py"], env=_clean_env)
+            self._set_headers(200)
+            self.wfile.write(json.dumps({"status": "success", "message": "QR code displayed"}).encode('utf-8'))
         else:
             # Handle other GET requests
             #self.send_error(404, "File Not Found")
