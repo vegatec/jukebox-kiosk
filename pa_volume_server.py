@@ -20,6 +20,10 @@ SINK_IDENTIFIER = "0"
 global_volume_state = {"level": 0}
 volume_lock = threading.Lock()
 
+# Tracks the currently-displayed maintenance overlay process, if any.
+maintenance_state = {"process": None}
+maintenance_lock = threading.Lock()
+
 # --- Utility Functions ---
 
 def get_current_volume():
@@ -115,6 +119,29 @@ def execute_volume_set(percentage):
         return False, f"An unexpected error occurred: {e}"
 
 
+def _terminate_maintenance_process():
+    """Kills the currently-tracked maintenance overlay process, if still running."""
+    process = maintenance_state['process']
+    if process is not None and process.poll() is None:
+        process.terminate()
+    maintenance_state['process'] = None
+
+
+def show_maintenance_message(message):
+    """Replaces any currently-shown maintenance overlay with one showing `message`."""
+    with maintenance_lock:
+        _terminate_maintenance_process()
+        maintenance_state['process'] = subprocess.Popen(
+            ["python3", "maintenance-indicator.py", message], env=_clean_env
+        )
+
+
+def dismiss_maintenance_message():
+    """Closes the currently-shown maintenance overlay, if any."""
+    with maintenance_lock:
+        _terminate_maintenance_process()
+
+
 # Initialize global state with current volume
 get_current_volume() 
 print(f"Initial Volume: {global_volume_state['level']}%")
@@ -129,7 +156,7 @@ class SSEVolumeHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header('Content-type', content_type)
         # CORS Headers to allow cross-origin requests
         self.send_header('Access-Control-Allow-Origin', '*') 
-        self.send_header('Access-Control-Allow-Methods', 'POST, GET, OPTIONS') 
+        self.send_header('Access-Control-Allow-Methods', 'POST, GET, DELETE, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.end_headers()
 
@@ -197,12 +224,44 @@ class SSEVolumeHandler(http.server.SimpleHTTPRequestHandler):
             # FALLBACK: Use the built-in logic to serve files (app-launcher.html)
             super().do_GET()
 
+    # --- Maintenance Overlay Endpoint (DELETE /maintenance) ---
+    def do_DELETE(self):
+        """Dismisses the currently-shown maintenance overlay, if any."""
+        if self.path == '/maintenance':
+            dismiss_maintenance_message()
+            self._set_headers(200)
+            self.wfile.write(json.dumps({"status": "success", "message": "Maintenance message dismissed"}).encode('utf-8'))
+        else:
+            self._set_headers(404)
+            self.wfile.write(json.dumps({"status": "error", "message": "Not found"}).encode('utf-8'))
+
     # --- Volume Control Endpoint (POST /) ---
     def do_POST(self):
-        """Handle POST requests to change volume."""
+        """Handle POST requests to change volume or show a maintenance message."""
         content_length = int(self.headers.get('Content-Length', 0))
         post_data = self.rfile.read(content_length)
-        
+
+        if self.path == '/maintenance':
+            try:
+                data = json.loads(post_data.decode('utf-8'))
+                message = data.get('message', '').strip()
+                if not message:
+                    response = {"status": "error", "message": "Field 'message' is required."}
+                    self._set_headers(400)
+                else:
+                    show_maintenance_message(message)
+                    response = {"status": "success", "message": "Maintenance message displayed"}
+                    self._set_headers(200)
+            except json.JSONDecodeError:
+                response = {"status": "error", "message": "Invalid JSON format."}
+                self._set_headers(400)
+            except Exception as e:
+                response = {"status": "error", "message": f"Server error: {e}"}
+                self._set_headers(500)
+
+            self.wfile.write(json.dumps(response).encode('utf-8'))
+            return
+
         try:
             data = json.loads(post_data.decode('utf-8'))
             action = data.get('action')

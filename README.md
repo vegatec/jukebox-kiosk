@@ -100,6 +100,24 @@ EOF
 sudo systemctl restart acpid
 ```
 
+### POST `/maintenance`
+
+Shows a centered maintenance message overlay that stays on screen indefinitely — posting a new message replaces whatever is currently shown.
+
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"message":"System rebooting for updates, back in 10 minutes."}' \
+  http://localhost:8000/maintenance
+```
+
+### DELETE `/maintenance`
+
+Dismisses the currently-shown maintenance overlay, if any.
+
+```bash
+curl -X DELETE http://localhost:8000/maintenance
+```
+
 ## Visual Overlays
 
 All overlays are spawned as fire-and-forget subprocesses and require a display (X11 or Wayland).
@@ -107,6 +125,7 @@ All overlays are spawned as fire-and-forget subprocesses and require a display (
 - **`volume-indicator.py`** — shown on every volume change; displays current level as a cyan arc
 - **`qr-indicator.py`** — shown on `GET /qr`; displays a scannable QR code and URL
 - **`power-menu.py`** — shown on `GET /power-menu`; three-phase menu → PIN → volume slider
+- **`maintenance-indicator.py`** — shown on `POST /maintenance`; stays until replaced or dismissed via `DELETE /maintenance` (the only overlay that doesn't auto-dismiss)
 
 ## Configuration
 
